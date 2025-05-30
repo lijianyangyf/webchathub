@@ -72,7 +72,7 @@ HubCommand 枚举：JoinRoom, LeaveRoom, SendMessage……
 
 - a) reader 循环：读取到一条 ClientRequest → 转换成 HubCommand 通过 hub_tx 发送给 ChatHub
 - b) writer 循环：先在连接初期创建一个 broadcast::Receiver，
-- 
+
 不断接收来自该房间的 ServerEvent 并推送给 WebSocket/TCP 客户端。
 
 在 JoinRoom 时：从 hub 端拿到对应 broadcast::Sender，clone 一个 Receiver。
