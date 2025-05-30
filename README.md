@@ -99,9 +99,9 @@ main(server.rs)：初始化日志、加载配置 → 启动 ChatHub (spawn hub t
 listener 接入 → WebSocket/TCP 握手 → spawn connection_handler(task)
 ### 4.3 加入房间：
 
-client 发送 ```rust { "type":"Join", "room":"rust", "name":"alice" } ```
+client 发送 ``` { "type":"Join", "room":"rust", "name":"alice" } ```
 
-connection_handler 将其封装成 ```rust HubCommand::JoinRoom(room, name, reply_tx) → hub_tx.send ```
+connection_handler 将其封装成 ``` HubCommand::JoinRoom(room, name, reply_tx) → hub_tx.send ```
 
 ChatHub 收到 → 如果 room 不存在则创建 broadcast::channel → clone sender
 
@@ -210,7 +210,7 @@ env_logger = "0.9"
   - 定义 enum ChatError（I/O、Serde、WebSocket、Channel 断连等）
   - 实现 From<io::Error>、From<tungstenite::Error>、Display
 - 要点：提前统一错误类型，后续模块可 Result<T, ChatError>
-- 
+
 ### 6.3 消息协议：protocol.rs
 
 - 定义 ClientRequest、ServerEvent enum，派生 Serialize, Deserialize, Clone；
