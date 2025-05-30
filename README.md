@@ -14,7 +14,9 @@
 
 ---
 
-## 2 工程目录结构（示例）
+## 2 工程目录结构
+
+```text
 my_chat/
 ├─ Cargo.toml
 └─ src/
@@ -32,6 +34,7 @@ my_chat/
 └─ client/
 ├─ mod.rs # Client 模块声明
 └─ ui.rs # CLI 输入/输出处理
+```
 
 ---
 
