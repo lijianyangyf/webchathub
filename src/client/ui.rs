@@ -1,89 +1,161 @@
-// src/client/ui.rs
-
 use crate::protocol::{ClientRequest, ServerEvent};
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
-use std::io::{self, BufRead};
-use tokio::net::TcpStream;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use tui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
+
+use std::io;
+use std::time::Duration;
 
 pub async fn start_cli_client(ws_url: &str) -> anyhow::Result<()> {
-    // 连接服务器
+    // 启用伪图形终端
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // 连接 WebSocket 服务器
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // 提示用户输入 /join room name
-    println!("请输入 /rooms 查询房间，或 /join <房间名> <用户名> 加入房间。");
-
+    // 交互区状态
+    let mut messages: Vec<String> = vec!["欢迎来到聊天室！请输入 /rooms 查询房间，或 /join <房间名> <用户名>".to_string()];
+    let mut input = String::new();
+    let mut joined = false;
     let mut room = String::new();
     let mut name = String::new();
 
-    loop {
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let tokens: Vec<_> = input.trim().split_whitespace().collect();
-        if tokens.len() == 1 && tokens[0] == "/rooms" {
-            ws_sender.send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?)).await?;
-            if let Some(Ok(msg)) = ws_receiver.next().await {
-                if msg.is_text() {
-                    if let Ok(ServerEvent::RoomList { rooms }) = serde_json::from_str(msg.to_text().unwrap()) {
-                        println!("当前房间列表: {:?}", rooms);
-                    }
-                }
-            }
-            println!("请继续输入 /join <房间名> <用户名> 加入房间。");
-            continue;
-        } else if tokens.len() == 3 && tokens[0] == "/join" {
-            room = tokens[1].to_string();
-            name = tokens[2].to_string();
-            break;
-        } else {
-            println!("命令格式错误，请输入 /rooms 或 /join <房间名> <用户名>");
-        }
-    }
-    // 发送 Join 请求
-    let join_msg = ClientRequest::Join { room: room.clone(), name: name.clone() };
-    ws_sender.send(Message::Text(serde_json::to_string(&join_msg)?)).await?;
-    println!("已加入房间 [{}]，现在可以发送消息，输入 /leave 退出。", room);
+    // tokio channel 用于异步收消息
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // 2. 启动异步任务：接收服务器推送并打印
-    let ws_receiver = ws_receiver; // 只做一次 move
+    // tokio任务，实时收服务器推送并发到channel
     tokio::spawn(async move {
-        let mut ws_receiver = ws_receiver;
         while let Some(Ok(msg)) = ws_receiver.next().await {
             if msg.is_text() {
                 if let Ok(event) = serde_json::from_str::<ServerEvent>(msg.to_text().unwrap()) {
                     match event {
-                        ServerEvent::UserJoined { name, .. } => println!("👤 {} 加入了房间", name),
-                        ServerEvent::UserLeft { name, .. } => println!("👋 {} 离开了房间", name),
-                        ServerEvent::NewMessage { name, text, .. } => println!("{}: {}", name, text),
-                        ServerEvent::RoomList { rooms } => println!("当前房间列表: {:?}", rooms),
+                        ServerEvent::UserJoined { name, .. } => {
+                            let _ = msg_tx.send(format!("👤 {} 加入了房间", name));
+                        }
+                        ServerEvent::UserLeft { name, .. } => {
+                            let _ = msg_tx.send(format!("👋 {} 离开了房间", name));
+                        }
+                        ServerEvent::NewMessage { name, text, .. } => {
+                            let _ = msg_tx.send(format!("{}: {}", name, text));
+                        }
+                        ServerEvent::RoomList { rooms } => {
+                            let _ = msg_tx.send(format!("当前房间列表: {:?}", rooms));
+                        }
                     }
                 }
             } else if msg.is_close() {
-                println!("服务器已关闭连接。");
+                let _ = msg_tx.send("服务器已关闭连接。".to_string());
                 break;
             }
         }
     });
 
-    // 3. 主循环读取用户输入
-    let mut input = String::new();
+    // 主 UI 事件循环
     loop {
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim();
-        if trimmed == "/leave" {
-            let leave_msg = ClientRequest::Leave { room: room.clone() };
-            ws_sender.send(Message::Text(serde_json::to_string(&leave_msg)?)).await?;
-            println!("你已离开房间。");
-            break;
-        } else if !trimmed.is_empty() {
-            let msg = ClientRequest::Message { room: room.clone(), text: trimmed.into() };
-            ws_sender.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        // 非阻塞地收服务器消息，实时刷消息区
+        while let Ok(msg) = msg_rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // 渲染整个界面
+        terminal.draw(|f| {
+            let size = f.size();
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
+                .split(size);
+
+            // 消息区
+            let msg_str = messages.iter().rev().take((layout[0].height as usize)-2).collect::<Vec<_>>().into_iter().rev().cloned().collect::<Vec<_>>().join("\n");
+            let msg_block = Paragraph::new(msg_str)
+                .block(Block::default().borders(Borders::ALL).title("聊天记录"));
+            f.render_widget(msg_block, layout[0]);
+
+            // 输入区
+            let prompt = if joined {
+                format!("{}@{}> {}", name, room, input)
+            } else {
+                format!("> {}", input)
+            };
+            let input_block = Paragraph::new(prompt)
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title("输入"));
+            f.render_widget(input_block, layout[1]);
+        })?;
+
+        // 处理输入
+        if event::poll(Duration::from_millis(80))? {
+        if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
+            // 只处理第一次按下（忽略重复）
+            if kind == KeyEventKind::Press {
+                match code {
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Esc => break,
+                    KeyCode::Enter => {
+                        let trimmed = input.trim();
+                        if trimmed.is_empty() {
+                            input.clear();
+                            continue;
+                        }
+                        if !joined {
+                            let tokens: Vec<_> = trimmed.split_whitespace().collect();
+                            if tokens.len() == 1 && tokens[0] == "/rooms" {
+                                ws_sender.send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?)).await?;
+                            } else if tokens.len() == 3 && tokens[0] == "/join" {
+                                room = tokens[1].to_string();
+                                name = tokens[2].to_string();
+                                let join_msg = ClientRequest::Join { room: room.clone(), name: name.clone() };
+                                ws_sender.send(Message::Text(serde_json::to_string(&join_msg)?)).await?;
+                                joined = true;
+                                messages.push(format!("已加入房间 [{}]，现在可以发送消息，输入 /leave 退出。", room));
+                            } else {
+                                messages.push("命令格式错误，请输入 /rooms 或 /join <房间名> <用户名>".to_string());
+                            }
+                        } else {
+                            if trimmed == "/leave" {
+                                let leave_msg = ClientRequest::Leave { room: room.clone() };
+                                ws_sender.send(Message::Text(serde_json::to_string(&leave_msg)?)).await?;
+                                messages.push("你已离开房间。".to_string());
+                                break;
+                            } else if !trimmed.is_empty() {
+                                let msg = ClientRequest::Message { room: room.clone(), text: trimmed.into() };
+                                ws_sender.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                            }
+                        }
+                        input.clear();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
+    }
 
+    // 恢复终端
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
     Ok(())
 }
