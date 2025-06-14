@@ -1,146 +1,247 @@
-//! web_client.rs – serve a one‑page HTML/JS client with a TUI‑like look (matching ui.rs)
-use std::{env, net::SocketAddr};
-use anyhow::Result;
-use warp::Filter;
+//! src/bin/web_client.rs
+//! ----------------------------------------------------------
+//! $ cargo run --bin web_client ws://127.0.0.1:9000 8000
+//!  - 起一个本地 HTTP 服务 (端口可自选，默认 8000)
+//!  - 自动打开浏览器
+//!  - 支持房间列表 → 加入 → 聊天 → 离开（离开后关闭页面并结束进程）
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Usage: web_client [ws://addr:port] [http_port]
-    let mut args = env::args().skip(1);
-    let ws_addr = args.next().unwrap_or_else(|| "ws://127.0.0.1:9000".into());
-    let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(8000);
+use std::sync::{Arc, Mutex};
 
-    // Build static page once then serve it for every request
-    let html = build_html(&ws_addr);
-    let route = warp::path::end().map(move || warp::reply::html(html.clone()));
+use tokio::sync::oneshot;
+use warp::{Filter, Reply};
 
-    let listen: SocketAddr = ([127, 0, 0, 1], port).into();
-    let url = format!("http://{}/", listen);
-    eprintln!("Serving chat UI at {}", url);
-    let _ = webbrowser::open(&url);
-
-    warp::serve(route).run(listen).await;
-    Ok(())
-}
-
-/// Produce a self‑contained HTML page.  `WS_ADDR` placeholder is substituted.
-fn build_html(ws_addr: &str) -> String {
-    const PAGE: &str = r#"<!DOCTYPE html><html lang='en'>
-<head><meta charset='utf-8'/>
+/*──────────────────── HTML 模板 ────────────────────*/
+const HTML: &str = r#"
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>
 <title>Rust Chat</title>
 <style>
-    :root {
-        --bg: #1e1e1e;
-        --fg: #f0f0f0;
-        --accent: #555;
-        --border: #555;
-    }
-    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:monospace;display:flex;flex-direction:column}
-
-    /* Top bar */
-    #top-bar{display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:#333;border-bottom:1px solid var(--border)}
-    #top-bar h1{font-size:1rem;margin:0;color:var(--fg)}
-
-    /* Buttons */
-    button{background:var(--accent);color:var(--fg);border:none;padding:4px 12px;border-radius:4px;cursor:pointer}
-    button:disabled{opacity:.4;cursor:not-allowed}
-
-    /* Panels mimic tui::widgets::Block */
-    .panel{position:relative;border:1px solid var(--border);border-radius:4px;margin:6px;display:flex;flex-direction:column}
-    .panel::before{content:attr(data-title);position:absolute;top:-0.65em;left:8px;background:var(--bg);padding:0 4px;font-size:.8em;color:#999}
-
-    #log{flex:1;overflow-y:auto;padding:8px;white-space:pre-wrap}
-    #input-bar{flex:none;flex-direction:row;gap:4px;padding:4px;align-items:center}
-    #input{flex:1;background:#222;color:var(--fg);border:none;outline:none;padding:4px;font-family:inherit}
+html,body{margin:0;height:100%;background:#1e1e1e;color:#ddd;font:14px/1.4 "JetBrains Mono",monospace}
+#topbar{background:#2d2d2d;padding:6px 8px;display:flex;align-items:center;gap:8px}
+#title{flex:1;font-weight:bold}
+button{background:#5865f2;border:none;border-radius:4px;padding:4px 10px;color:#fff;cursor:pointer}
+button:disabled{opacity:.35;cursor:default}
+#messages{height:calc(100vh - 150px);overflow-y:auto;padding:8px;border:1px solid #555;margin:8px;border-radius:4px;white-space:pre-wrap}
+#inputbar{display:flex;gap:6px;padding:0 8px 8px}
+#input{flex:1;padding:6px;border:1px solid #555;border-radius:4px;background:#2d2d2d;color:#ddd}
+#joinModal{display:none;position:fixed;inset:0;background:#0008;align-items:center;justify-content:center}
+#joinCard{background:#2d2d2d;padding:16px 20px;border-radius:6px;display:flex;flex-direction:column;gap:10px;width:260px}
+label{display:flex;flex-direction:column;gap:2px;font-size:12px}
+input[type=text]{padding:6px;border:1px solid #555;border-radius:4px;background:#1e1e1e;color:#ddd}
 </style></head><body>
-    <div id='top-bar'>
-        <h1>Rust Chat</h1>
-        <div>
-            <button id='btn-rooms'>房间列表</button>
-            <button id='btn-leave' disabled>离开</button>
-        </div>
-    </div>
+<header id="topbar">
+  <div id="title">Not joined</div>
+  <button id="roomsBtn">房间列表</button>
+  <button id="joinBtn">加入房间</button>
+  <button id="leaveBtn" disabled>离开房间</button>
+</header>
+<main id="messages"></main>
+<footer id="inputbar">
+  <input id="input" placeholder="输入消息，Enter 发送" autocomplete="off"/>
+  <button id="sendBtn">发送</button>
+</footer>
 
-    <div id='log' class='panel' data-title='聊天记录'></div>
-
-    <div id='input-bar' class='panel' data-title='输入'>
-        <input id='input' placeholder='> '/>
-        <button id='send'>发送</button>
-    </div>
+<!-- —— Join modal —— -->
+<div id="joinModal">
+  <div id="joinCard">
+    <label>房间<input id="roomFld" type="text" autocomplete="off"/></label>
+    <label>昵称<input id="nickFld" type="text" autocomplete="off"/></label>
+    <button id="joinOk">进入</button>
+  </div>
+</div>
 
 <script>
-// Utility helpers ------------------------------------------------------------
-const log = document.getElementById('log');
-function append(m){const d=document.createElement('div');d.textContent=m;log.appendChild(d);log.scrollTop=log.scrollHeight;}
-function pkt(variant,data){if(data===undefined)return JSON.stringify(variant);const o={};o[variant]=data;return JSON.stringify(o);}
+(() => {
+  const WS_URL = "%WS%";
 
-// WebSocket ------------------------------------------------------------------
-const ws = new WebSocket('WS_ADDR');
-ws.addEventListener('open',  ()=>append('[connected]'));
-ws.addEventListener('close', ()=>append('[connection closed]'));
-ws.addEventListener('error', e=>append('[error] '+e.message));
-ws.addEventListener('message', ev=>{
-    // Attempt to parse server event JSON and pretty‑print
-    const raw = ev.data;
-    try {
-        const obj = JSON.parse(raw);
-        const [k,v] = Object.entries(obj)[0] || [];
-        switch(k){
-            case 'NewMessage':
-            case 'Message':
-                append(`${v.name} : ${v.text}`);
-                return;
-            case 'UserJoined':
-                append(`👤 ${v.name} 加入了房间`);
-                return;
-            case 'UserLeft':
-                append(`👋 ${v.name} 离开了房间`);
-                return;
-            case 'RoomList':
-                append(`当前房间列表: ${JSON.stringify(v.rooms)}`);
-                return;
-        }
-    } catch(e) { /* fall through */ }
-    append(raw); // fallback to raw string
-});
+  let joined = false,
+      currentRoom = "",
+      currentNick = "",
+      pendingRoom = "";     // 发送 Join 后等待服务器确认
 
-// State ----------------------------------------------------------------------
-let currentRoom=null;const leaveBtn=document.getElementById('btn-leave');
+  /* ---------- DOM ---------- */
+  const $ = id => document.getElementById(id);
+  const msgBox   = $("messages");
+  const input    = $("input");
+  const sendBtn  = $("sendBtn");
+  const roomsBtn = $("roomsBtn");
+  const joinBtn  = $("joinBtn");
+  const leaveBtn = $("leaveBtn");
+  const joinModal= $("joinModal");
+  const roomFld  = $("roomFld");
+  const nickFld  = $("nickFld");
+  const joinOk   = $("joinOk");
+  const titleBar = $("title");
 
-// Sending logic (shared by Enter key & 发送 button) ---------------------------
-function doSend(){
-    const box=document.getElementById('input');
-    const txt=box.value.trim(); if(!txt) return; box.value='';
-    let msg;
-    if(txt.startsWith('/rooms')){
-        msg=pkt('RoomList');
-    }else if(txt.startsWith('/join ')){
-        const [,room,nick]=txt.split(' ');
-        if(!room||!nick){append('[usage] /join <room> <nick>');return;}
-        currentRoom=room; leaveBtn.disabled=false;
-        msg=pkt('Join',{room,name:nick});
-    }else if(txt.startsWith('/leave')){
-        leave(); return; // will call ws.send inside leave()
-    }else{
-        if(!currentRoom){append('[join a room first]');return;}
-        msg=pkt('Message',{room:currentRoom,text:txt});
+  const println = t => { msgBox.textContent += t + "\n"; msgBox.scrollTop = msgBox.scrollHeight; };
+
+  /* ---------- 序列化成服务器理解的 JSON ---------- */
+  function pkt(tag, data){
+    return data === undefined
+      ? JSON.stringify(tag)            // unit variant
+      : JSON.stringify({ [tag]: data }); // struct variant
+  }
+
+  /* ---------- WebSocket ---------- */
+  const ws = new WebSocket(WS_URL);
+  ws.onopen  = () => println("[已连接到服务器]");
+  ws.onerror = e  => println("[WS 错误] "+e);
+  ws.onclose = () => println("[连接已断开]");
+
+  ws.onmessage = ev => {
+    let v;
+    try { v = JSON.parse(ev.data); }
+    catch { maybePlainJoined(ev.data); return; }
+
+    if (typeof v === "string") { maybePlainJoined(v); return; }
+
+    const tag = Object.keys(v)[0];
+    const d   = v[tag];
+
+    switch(tag){
+      case "RoomList":
+        println("[房间列表] "+ d.rooms.join(", "));
+        break;
+
+      /* ----------- 自己加入成功的多种可能变体 ----------- */
+      case "Joined":
+      case "JoinAck":
+      case "JoinedRoom":
+        mark_joined(d.room, d.name ?? currentNick);
+        break;
+
+      case "UserJoined":       /* 服务器广播，包括自己 */
+        println(`👤 ${d.name} 加入了房间`);
+        if (!joined && d.name === currentNick)       // 这就是我自己
+          mark_joined(d.room ?? pendingRoom, d.name);
+        break;
+
+      /* ----------- 聊天 / 离开 ----------- */
+      case "NewMessage":
+        println(`${d.name} : ${d.text ?? d.msg}`);
+        break;
+
+      case "UserLeft":
+        println(`👋 ${d.name} 离开了房间`);
+        break;
+
+      case "Left":
+        local_leave();
+        break;
+
+      default:
+        println(ev.data);
     }
-    ws.send(msg);
+  };
+
+  /* ---------- helpers ---------- */
+  function mark_joined(room, nick){
+    joined = true;
+    currentRoom = room;
+    currentNick = nick;
+    titleBar.textContent = `${nick}@${room}`;
+    joinBtn.disabled  = true;
+    leaveBtn.disabled = false;
+    println(`[已加入] ${room}`);
+  }
+
+  function local_leave(){
+    joined = false; currentRoom = "";
+    titleBar.textContent = "Not joined";
+    joinBtn.disabled = false; leaveBtn.disabled = true;
+    fetch("/shutdown",{method:"POST"}).finally(()=>{
+      try{window.close();}catch{}
+      window.location.replace("about:blank");
+    });
+  }
+
+  /** 服务器可能发送纯文本 "Joined room xxx" */
+  function maybePlainJoined(s){
+    const m = /^Joined\b.*?(?=room\s+)?\s+([^\s]+)$/i.exec(s);
+    if (m && !joined) mark_joined(m[1], currentNick);
+    else println(s);
+  }
+
+  /* ---------- UI events ---------- */
+  roomsBtn.onclick = ()=>ws.send(pkt("RoomList"));
+
+  joinBtn.onclick  = ()=>{
+    joinModal.style.display="flex";
+    roomFld.value = nickFld.value = "";
+    roomFld.focus();
+  };
+
+  joinOk.onclick   = ()=>{
+    const r = roomFld.value.trim(), n = nickFld.value.trim();
+    if(!r||!n) return;
+    pendingRoom = r; currentNick = n;
+    ws.send(pkt("Join",{ room:r, name:n }));
+    joinModal.style.display="none";
+  };
+
+  leaveBtn.onclick = ()=>{ if(joined) ws.send(pkt("Leave")); };
+
+  sendBtn.onclick  = ()=>{
+    const txt = input.value.trim();
+    if(!txt||!joined) return;
+    ws.send(pkt("Message",{ room:currentRoom, text:txt }));  /* 如需 msg:txt 请改字段 */
+    input.value="";
+  };
+
+  /* Enter 键快捷 */
+  input.addEventListener("keypress",e=>{ if(e.key==="Enter") sendBtn.onclick(); });
+  roomFld.addEventListener("keypress",e=>{ if(e.key==="Enter") joinOk.onclick(); });
+  nickFld.addEventListener("keypress",e=>{ if(e.key==="Enter") joinOk.onclick(); });
+})();
+</script></body></html>
+"#;
+
+/*──────────────────── warp 过滤器 ────────────────────*/
+fn routes(
+    html: String,
+    tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
+    let page = warp::path::end().map(move || warp::reply::html(html.clone()));
+
+    let shutdown = warp::path("shutdown")
+        .and(warp::post())
+        .map(move || {
+            if let Some(s) = tx.lock().unwrap().take() {
+                let _ = s.send(());
+            }
+            "ok"
+        });
+
+    page.or(shutdown)
 }
 
-document.getElementById('send').addEventListener('click', doSend);
-document.getElementById('input').addEventListener('keydown', e=>{if(e.key==='Enter') doSend();});
+/*──────────────────── main ───────────────────────────*/
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    /* ---- CLI (<ws-url> <port>)，留默认方便双击 ---- */
+    let mut args = std::env::args().skip(1);
+    let ws_url   = args.next().unwrap_or_else(|| "ws://127.0.0.1:9000".into());
+    let port: u16 = args.next()
+        .unwrap_or_else(|| "8000".into())
+        .parse()
+        .expect("bad port");
 
-document.getElementById('btn-rooms').addEventListener('click', ()=>ws.send(pkt('RoomList')));
+    /* ---- build HTML + shutdown channel ---- */
+    let html = HTML.replace("%WS%", &ws_url);
+    let (tx, rx) = oneshot::channel::<()>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
 
-document.getElementById('btn-leave').addEventListener('click', leave);
-function leave(){
-    if(!currentRoom){append('[未加入房间]');return;}
-    ws.send(pkt('Leave',{room:currentRoom}));
-    append(`[离开房间] ${currentRoom}`);
-    currentRoom=null; leaveBtn.disabled=true;
-}
-</script>
-</body></html>"#;
-    PAGE.replace("WS_ADDR", ws_addr)
+    /* ---- HTTP server ---- */
+    let (addr, server) = warp::serve(routes(html, tx))
+        .bind_ephemeral(([127, 0, 0, 1], port));
+    tokio::spawn(server);
+
+    /* ---- auto-open browser ---- */
+    if let Err(e) = open::that(format!("http://{}", addr)) {
+        eprintln!("Failed to open browser: {e}");
+    }
+
+    /* ---- wait for /shutdown ---- */
+    let _ = rx.await;
+    println!("Shutdown signal received – exiting.");
+    Ok(())
 }

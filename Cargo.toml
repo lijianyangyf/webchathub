@@ -18,3 +18,4 @@ tui = "0.19"
 crossterm = "0.29.0"
 warp = { version = "0.3", features = ["tls"] }
 webbrowser  = "0.8"
+open = "3"
