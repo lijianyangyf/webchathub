@@ -10,14 +10,17 @@ side.
 ## ✨ Features
 
 * **Async everywhere** – built on `tokio` and `tokio‑tungstenite`.
-* **Room‑based chat** – users join named rooms, messages are scoped to the room.
+* **Room‑based chat** – users join named rooms; messages are scoped to the room.
 * **Broadcast hub** – one task per room, using `tokio::sync::broadcast`.
 * **Interactive terminal client** – `tui` + `crossterm`, supports scroll‑back,
   command shortcuts and real‑time updates.
+* **Member list query** – `/members` instantly shows who’s online in the room.  *(new in v0.2)*
+* **Limited message history** – the server keeps the last *N* messages in a
+  ring‑buffer and replays them (with timestamps) to newcomers. *(new in v0.2)*
 * **JSON protocol** – a minimal, versioned client/server message format.
-* **Config via env** – server address, log level, buffer sizes.
-* **Extensible** – traits/structs are loosely coupled, ready for HTTP, TLS,
-  persistence or metrics add‑ons.
+* **Config via env** – server address, log level, buffer & history size.
+* **Extensible** – loosely‑coupled modules ready for HTTP, TLS, persistence
+  or metrics add‑ons.
 
 ---
 
@@ -36,37 +39,38 @@ my_chat/
    ├─ server/
    │   ├─ mod.rs
    │   └─ listener.rs      # TCP acceptor & per‑connection handler
-   ├─ hub.rs               # ChatHub: room registry + command loop
+   ├─ hub.rs               # ChatHub: room registry + command loop (+history)
    ├─ protocol.rs          # ClientRequest / ServerEvent enums
-   ├─ error.rs             # ChatError + Result alias
    ├─ config.rs            # Config::from_env()
+   ├─ error.rs             # ChatError + Result alias
    └─ lib.rs               # re‑exports
 ```
 
 ---
 
-## 📜 Protocol (v1)
+## 📜 Protocol (v1.1)
 
 ### Client → Server (`ClientRequest`)
 | Variant | Fields | Notes |
 |---------|--------|-------|
-| `ListRooms` | – | ask for current room names |
-| `Join`      | `room: String`, `nick: String` | first message after connect |
-| `SendMsg`   | `text: String` | UTF‑8, max 2 kB |
-| `Leave`     | – | leave current room |
+| `Join`      | `room`, `name` | first message after connect |
+| `Leave`     | `room` | leave room |
+| `Message`   | `room`, `text` | UTF‑8, max 2 kB |
+| `RoomList`  | – | ask for current room names |
+| `Members`   | `room` | **new** – ask for online members |
 
 ### Server → Client (`ServerEvent`)
 | Variant | Fields | Notes |
 |---------|--------|-------|
-| `RoomList`   | `rooms: Vec<String>` |
-| `Joined`     | `room`, `members` |
-| `UserJoined` | `nick` |
-| `UserLeft`   | `nick` |
-| `Message`    | `from`, `text`, `ts` |
+| `RoomList`   | `rooms` |
+| `MemberList` | `room`, `members` | **new** |
+| `UserJoined` | `room`, `name` |
+| `UserLeft`   | `room`, `name` |
+| `NewMessage` | `room`, `name`, `text`, `ts` | `ts` = Unix millis |
 | `Error`      | `reason` |
 
-Ping/Pong frames are handled automatically by tungstenite; application‑level
-heart‑beats can be added in the future.
+Historical messages are replayed as a burst of `NewMessage` events right after
+`Join` acknowledgement.
 
 ---
 
@@ -74,9 +78,10 @@ heart‑beats can be added in the future.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `CHAT_ADDR`   | `0.0.0.0:9000` | TCP address to bind the websocket server |
-| `CHAT_LOG`    | `info`         | `trace`, `debug`, `info`, `warn`, `error` |
-| `CHAT_ROOM_BUFFER` | `128` | broadcast channel capacity per room |
+| `SERVER_ADDR`   | `0.0.0.0:9000` | TCP address to bind the websocket server |
+| `LOG_LEVEL`     | `info`         | `trace`, `debug`, `info`, `warn`, `error` |
+| `HISTORY_LIMIT` | `100`          | messages kept per‑room for history replay |
+| `ROOM_BUFFER`   | `1024`         | broadcast channel capacity per room |
 
 ---
 
@@ -90,8 +95,17 @@ cargo run --bin server
 cargo run --bin client ws://127.0.0.1:9000
 ```
 
-> Press **`?`** inside the client for a quick help screen.  
-> Supported commands: `/rooms`, `/join <room>`, `/leave`, `/quit`.
+Available commands inside the client:
+
+```
+/rooms                   # list rooms
+/join <room> <name>      # enter room
+/members                 # who’s online
+/leave                   # exit room
+<text>                   # ordinary chat message
+```
+
+Press **Esc** to quit and restore your terminal.
 
 ---
 
@@ -99,16 +113,17 @@ cargo run --bin client ws://127.0.0.1:9000
 
 * **Server** – Ctrl‑C is caught; tasks are notified and the listener stops
   accepting.  
-* **Client** – Esc or `/quit` restores the terminal to the previous state.
+* **Client** – Esc or `/leave` restores the terminal to the previous state.
 
 ---
 
-## 📈 Roadmap / Ideas
+## 📈 Roadmap
 
-* Prometheus & OpenTelemetry instrumentation.
-* TLS & HTTP upgrade with `hyper` + `tokio‑rustls`.
-* Rate‑limiting and auth (JWT).
-* Message persistence (Redis Streams or S3 archive).
+* Prometheus & OpenTelemetry instrumentation
+* TLS & HTTP upgrade (`hyper` + `tokio-rustls`)
+* Rate‑limiting and auth (JWT)
+* Message persistence (Redis Streams or S3 archive)
+* Web‑based admin dashboard (planned)
 
 ---
 
@@ -123,3 +138,4 @@ cargo run --bin client ws://127.0.0.1:9000
 ## License
 
 MIT
+
