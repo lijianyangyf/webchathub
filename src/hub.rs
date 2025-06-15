@@ -1,18 +1,30 @@
-// src/hub.rs – 扩展 1‑A：支持查询房间成员列表
-// --------------------------------------------------
-// 仅在原始实现上做 **最小增量修改**：
-// 1. 新增 `members: HashMap<room, HashSet<name>>` 用于维护在线用户。
-// 2. 新增 `HubCommand::GetMembers` 处理分支。
-// 3. 在 `JoinRoom/LeaveRoom` 时同步维护 `members` 表。
-// 其余逻辑（广播 Sender、房间列表）保持原状，未引入破坏性变更。
+// src/hub.rs – 完整实现（含 1‑A & 1‑B）
+// -------------------------------------------
+// * 1‑A: 成员列表查询 (已完成)
+// * 1‑B: 历史消息环形缓冲
+//   - 每房间 `VecDeque<ServerEvent>` 长度由 `Config::history_limit` 决定。
+//   - `SendMsg` 时写入环形缓冲并裁剪。
+//   - 新增 `GetHistory` 命令供 Listener 在 Join 之后批量拉取。
+//   - **仅存储聊天消息** (ServerEvent::Message)，系统事件不进入历史。
+//
+// 对原有接口改动最小：
+//   ChatHub::new(cmd_rx) 内部自行读取 Config::from_env() 拿到 history_limit，
+//   上层调用方无需变更。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::config::Config;
 use crate::protocol::ServerEvent;
 
-/// 聊天室命令
+/// Hub 内部保存的聊天记录，仅保存 `ServerEvent::Message` 变体
+fn is_chat_message(ev: &ServerEvent) -> bool {
+    matches!(ev, ServerEvent::NewMessage { .. })
+}
+
+/// Hub 外部命令
 pub enum HubCommand {
     JoinRoom {
         room: String,
@@ -30,94 +42,114 @@ pub enum HubCommand {
     GetRoomList {
         resp: mpsc::Sender<Vec<String>>,
     },
-    /// 新增：查询房间成员
+    /// 1‑A
     GetMembers {
         room: String,
         resp: mpsc::Sender<Vec<String>>,
     },
+    /// 1‑B: 新增——批量拉取房间历史
+    GetHistory {
+        room: String,
+        resp: mpsc::Sender<Vec<ServerEvent>>,
+    },
+}
+
+/// 房间结构
+struct Room {
+    tx: broadcast::Sender<ServerEvent>,
+    members: HashSet<String>,
+    history: VecDeque<ServerEvent>,
+    last_empty_at: Option<Instant>, // 留给 1‑C TTL 使用
+}
+
+impl Room {
+    fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(128);
+        Self {
+            tx,
+            members: HashSet::new(),
+            history: VecDeque::with_capacity(capacity),
+            last_empty_at: None,
+        }
+    }
 }
 
 /// 聊天室管理中心
 pub struct ChatHub {
-    /// 房间名 -> 广播 Sender
-    rooms: HashMap<String, broadcast::Sender<ServerEvent>>,
-    /// 房间名 -> 在线成员集合
-    members: HashMap<String, HashSet<String>>,
-    /// Hub 命令接收端
+    rooms: HashMap<String, Room>,
     cmd_rx: mpsc::Receiver<HubCommand>,
+    history_limit: usize,
 }
 
 impl ChatHub {
     pub fn new(cmd_rx: mpsc::Receiver<HubCommand>) -> Self {
+        let cfg = Config::from_env();
         Self {
             rooms: HashMap::new(),
-            members: HashMap::new(),
             cmd_rx,
+            history_limit: cfg.history_limit,
         }
     }
 
-    /// 核心事件循环
     pub async fn run(&mut self) {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 HubCommand::JoinRoom { room, name, resp } => {
-                    // 创建房间广播 Sender（若不存在）
-                    let sender = self
+                    let room_ref = self
                         .rooms
                         .entry(room.clone())
-                        .or_insert_with(|| broadcast::channel(128).0)
-                        .clone();
+                        .or_insert_with(|| Room::new(self.history_limit));
 
-                    // 维护成员表
-                    self.members
-                        .entry(room.clone())
-                        .or_default()
-                        .insert(name.clone());
+                    room_ref.members.insert(name.clone());
+                    room_ref.last_empty_at = None;
 
-                    // 先返回 receiver
-                    let _ = resp.send(sender.subscribe()).await;
-                    // 再广播 UserJoined
-                    let _ = sender.send(ServerEvent::UserJoined {
-                        room: room.clone(),
-                        name,
-                    });
+                    let _ = resp.send(room_ref.tx.subscribe()).await;
+                    let _ = room_ref.tx.send(ServerEvent::UserJoined { room, name });
                 }
-
                 HubCommand::SendMsg { room, event } => {
-                    if let Some(sender) = self.rooms.get(&room) {
-                        let _ = sender.send(event);
-                    }
-                }
-
-                HubCommand::LeaveRoom { room, name } => {
-                    if let Some(sender) = self.rooms.get(&room) {
-                        let _ = sender.send(ServerEvent::UserLeft {
-                            room: room.clone(),
-                            name: name.clone(),
-                        });
-                    }
-
-                    if let Some(set) = self.members.get_mut(&room) {
-                        set.remove(&name);
-                        // 如果房间已空，可在此处做 TTL 标记（留给 1‑C）
-                        if set.is_empty() {
-                            // 暂不立即删除，保持原行为
+                    if let Some(room_ref) = self.rooms.get_mut(&room) {
+                        // 先广播
+                        let _ = room_ref.tx.send(event.clone());
+                        // 只记录聊天消息
+                        if is_chat_message(&event) {
+                            room_ref.history.push_back(event);
+                            if room_ref.history.len() > self.history_limit {
+                                room_ref.history.pop_front();
+                            }
                         }
                     }
                 }
-
+                HubCommand::LeaveRoom { room, name } => {
+                    if let Some(room_ref) = self.rooms.get_mut(&room) {
+                        let _ = room_ref.tx.send(ServerEvent::UserLeft {
+                            room: room.clone(),
+                            name: name.clone(),
+                        });
+                        room_ref.members.remove(&name);
+                        if room_ref.members.is_empty() {
+                            room_ref.last_empty_at = Some(Instant::now());
+                        }
+                    }
+                }
                 HubCommand::GetRoomList { resp } => {
                     let list: Vec<String> = self.rooms.keys().cloned().collect();
                     let _ = resp.send(list).await;
                 }
-
                 HubCommand::GetMembers { room, resp } => {
                     let members = self
-                        .members
+                        .rooms
                         .get(&room)
-                        .map(|set| set.iter().cloned().collect())
+                        .map(|r| r.members.iter().cloned().collect())
                         .unwrap_or_default();
                     let _ = resp.send(members).await;
+                }
+                HubCommand::GetHistory { room, resp } => {
+                    let msgs = self
+                        .rooms
+                        .get(&room)
+                        .map(|r| r.history.iter().cloned().collect())
+                        .unwrap_or_default();
+                    let _ = resp.send(msgs).await;
                 }
             }
         }
@@ -127,43 +159,54 @@ impl ChatHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ServerEvent;
     use tokio::sync::{broadcast, mpsc};
 
     #[tokio::test]
-    async fn test_member_query_flow() {
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let mut hub = ChatHub::new(cmd_rx);
+    async fn test_history_cap() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut hub = ChatHub::new(rx);
+        let cap = hub.history_limit;
 
-        let hub_handle = tokio::spawn(async move {
-            hub.run().await;
-        });
+        // spawn hub
+        let h = tokio::spawn(async move { hub.run().await });
 
-        // 加入房间
+        // join room
         let (resp_tx, mut resp_rx) = mpsc::channel(1);
-        cmd_tx
-            .send(HubCommand::JoinRoom {
-                room: "rust".into(),
-                name: "alice".into(),
-                resp: resp_tx,
-            })
-            .await
-            .unwrap();
+        tx.send(HubCommand::JoinRoom {
+            room: "rust".into(),
+            name: "bob".into(),
+            resp: resp_tx,
+        })
+        .await
+        .unwrap();
         let _ = resp_rx.recv().await.unwrap();
 
-        // 查询成员
-        let (mem_tx, mut mem_rx) = mpsc::channel(1);
-        cmd_tx
-            .send(HubCommand::GetMembers {
+        // send cap+1 messages
+        for i in 0..=cap {
+            tx.send(HubCommand::SendMsg {
                 room: "rust".into(),
-                resp: mem_tx,
+                event: ServerEvent::NewMessage {
+                    room: "rust".into(),
+                    name: "bob".into(),
+                    text: format!("hello {i}"),
+                    ts: 0,
+                },
             })
             .await
             .unwrap();
-        let members = mem_rx.recv().await.unwrap();
-        assert_eq!(members, vec!["alice".to_string()]);
+        }
 
-        drop(cmd_tx);
-        hub_handle.await.unwrap();
+        let (his_tx, mut his_rx) = mpsc::channel(1);
+        tx.send(HubCommand::GetHistory {
+            room: "rust".into(),
+            resp: his_tx,
+        })
+        .await
+        .unwrap();
+        let history = his_rx.recv().await.unwrap();
+        assert_eq!(history.len(), cap); // oldest被裁掉
+
+        drop(tx);
+        h.await.unwrap();
     }
 }

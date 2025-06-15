@@ -1,168 +1,234 @@
-use crate::protocol::{ClientRequest, ServerEvent};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+//! Terminal UI client based on `tui` + `crossterm`
+//
+// Commands (type in the input box):
+//   /join <room> <name>
+//   /leave
+//   /rooms
+//   /members
+//   <any other text>   -- send chat message
+
+use std::io::{self, Stdout};
+use std::time::Duration;
+
+use chrono::{Local, TimeZone};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,KeyEvent,KeyEventKind},
+    execute, terminal,
 };
+use futures_util::{Sink, SinkExt, StreamExt};
+use tokio::{
+    select,
+    sync::mpsc,
+    task,
+    time::{self, sleep},
+};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    text::Spans,
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
 
-use std::io;
-use std::time::Duration;
+use crate::protocol::{ClientRequest, ServerEvent};
 
-pub async fn start_cli_client(ws_url: &str) -> anyhow::Result<()> {
-    // 启用伪图形终端
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+const WS_DEFAULT: &str = "ws://127.0.0.1:9000";
 
-    // 连接 WebSocket 服务器
-    let (ws_stream, _) = connect_async(ws_url).await?;
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
+    let ws_addr = ws_addr.unwrap_or_else(|| WS_DEFAULT.to_string());
+    let (ws_stream, _) = connect_async(&ws_addr).await?;
+    let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-    // 交互区状态
-    let mut messages: Vec<String> = vec!["欢迎来到聊天室！请输入 /rooms 查询房间，或 /join <房间名> <用户名>".to_string()];
-    let mut input = String::new();
-    let mut joined = false;
-    let mut room = String::new();
-    let mut name = String::new();
+    // UI channel
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<String>();
 
-    // tokio channel 用于异步收消息
-    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Spawn reader task
+    {
+        let ui_tx = ui_tx.clone();
+        task::spawn(async move {
+            while let Some(Ok(msg)) = ws_stream.next().await {
+                if !msg.is_text() {
+                    continue;
+                }
+                let evt: ServerEvent = match serde_json::from_str(msg.to_text().unwrap()) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let _ = ui_tx.send(format!("⚠️  bad event: {e}"));
+                        continue;
+                    }
+                };
 
-    // tokio任务，实时收服务器推送并发到channel
-    tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_receiver.next().await {
-            if msg.is_text() {
-                if let Ok(event) = serde_json::from_str::<ServerEvent>(msg.to_text().unwrap()) {
-                    match event {
-                        ServerEvent::UserJoined { name, .. } => {
-                            let _ = msg_tx.send(format!("👤 {} 加入了房间", name));
-                        }
-                        ServerEvent::UserLeft { name, .. } => {
-                            let _ = msg_tx.send(format!("👋 {} 离开了房间", name));
-                        }
-                        ServerEvent::NewMessage { name, text, .. } => {
-                            let _ = msg_tx.send(format!("{}: {}", name, text));
-                        }
-                        ServerEvent::RoomList { rooms } => {
-                            let _ = msg_tx.send(format!("当前房间列表: {:?}", rooms));
-                        }
-                        ServerEvent::MemberList { room, members } =>{
-                            let _ = msg_tx.send(format!("房间 [{}] 成员: {:?}", room, members));
+                match evt {
+                    ServerEvent::NewMessage { name, text, ts, .. } => {
+                        if let Some(dt) = Local.timestamp_millis_opt(ts as i64).single() {
+                            let _ =
+                                ui_tx.send(format!("[{}] {}: {}", dt.format("%H:%M:%S"), name, text));
                         }
                     }
+                    ServerEvent::UserJoined { name, room } => {
+                        let _ = ui_tx.send(format!("🔔 {name} joined {room}"));
+                    }
+                    ServerEvent::UserLeft { name, room } => {
+                        let _ = ui_tx.send(format!("🔕 {name} left {room}"));
+                    }
+                    ServerEvent::RoomList { rooms } => {
+                        let _ = ui_tx.send(format!("📄 rooms: {:?}", rooms));
+                    }
+                    ServerEvent::MemberList { room, members } => {
+                        let _ = ui_tx.send(format!("👥 members in {room}: {:?}", members));
+                    }
                 }
-            } else if msg.is_close() {
-                let _ = msg_tx.send("服务器已关闭连接。".to_string());
-                break;
             }
-        }
-    });
+        });
+    }
 
-    // 主 UI 事件循环
+    // --- Terminal UI setup ---
+    enable_tui()?;
+    let mut terminal = init_terminal()?;
+    let mut input = String::new();
+    let mut messages: Vec<String> = Vec::new();
+    let mut room: Option<String> = None;
+
     loop {
-        // 非阻塞地收服务器消息，实时刷消息区
-        while let Ok(msg) = msg_rx.try_recv() {
-            messages.push(msg);
-        }
-
-        // 渲染整个界面
+        // Draw
         terminal.draw(|f| {
-            let size = f.size();
-            let layout = Layout::default()
+            let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
-                .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
-                .split(size);
+                .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
+                .split(f.size());
 
-            // 消息区
-            let msg_str = messages.iter().rev().take((layout[0].height as usize)-2).collect::<Vec<_>>().into_iter().rev().cloned().collect::<Vec<_>>().join("\n");
-            let msg_block = Paragraph::new(msg_str)
-                .block(Block::default().borders(Borders::ALL).title("聊天记录"));
-            f.render_widget(msg_block, layout[0]);
+            let items: Vec<ListItem> =
+                messages.iter().map(|m| ListItem::new(Spans::from(m.as_str()))).collect();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title("Messages"));
+            f.render_widget(list, chunks[0]);
 
-            // 输入区
-            let prompt = if joined {
-                format!("{}@{}> {}", name, room, input)
-            } else {
-                format!("> {}", input)
-            };
-            let input_block = Paragraph::new(prompt)
+            let inp = Paragraph::new(input.as_ref())
                 .style(Style::default().fg(Color::Yellow))
-                .block(Block::default().borders(Borders::ALL).title("输入"));
-            f.render_widget(input_block, layout[1]);
+                .block(Block::default().borders(Borders::ALL).title("Input"));
+            f.render_widget(inp, chunks[1]);
         })?;
 
-        // 处理输入
-        if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
-                // 只处理第一次按下（忽略重复）
-                if kind == KeyEventKind::Press {
-                    match code {
-                        KeyCode::Char(c) => {
-                            input.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            input.pop();
-                        }
-                        KeyCode::Esc => break,
-                        KeyCode::Enter => {
-                            let trimmed = input.trim();
-                            if trimmed.is_empty() {
-                                input.clear();
-                                continue;
-                            }
-                            if !joined {
-                                let tokens: Vec<_> = trimmed.split_whitespace().collect();
-                                if tokens.len() == 1 && tokens[0] == "/rooms" {
-                                    ws_sender.send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?)).await?;
-                                } else if tokens.len() == 3 && tokens[0] == "/join" {
-                                    room = tokens[1].to_string();
-                                    name = tokens[2].to_string();
-                                    let join_msg = ClientRequest::Join { room: room.clone(), name: name.clone() };
-                                    ws_sender.send(Message::Text(serde_json::to_string(&join_msg)?)).await?;
-                                    joined = true;
-                                    messages.push(format!("已加入房间 [{}]，现在可以发送消息，输入 /leave 退出。", room));
-                                } else {
-                                    messages.push("命令格式错误，请输入 /rooms 或 /join <房间名> <用户名>".to_string());
+        select! {
+            Some(line) = ui_rx.recv() => {
+                messages.push(line);
+            }
+
+            _ = sleep(Duration::from_millis(10)) => {
+                while event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
+                        if kind == KeyEventKind::Press {
+                            match code {
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => { input.pop(); }
+                                KeyCode::Enter => {
+                                    let cmd = input.trim().to_string();
+                                    input.clear();
+                                    if cmd.starts_with('/') {
+                                        handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;
+                                        if cmd == "/leave" {
+                                            messages.clear(); // free history memory
+                                        }
+                                    } else if let Some(r) = &room {
+                                        let req = ClientRequest::Message { room: r.clone(), text: cmd };
+                                        ws_sink.send(Message::Text(serde_json::to_string(&req)?)).await?;
+                                    } else {
+                                        messages.push("❗ join a room first".into());
+                                    }
                                 }
-                            } else {
-                                if trimmed == "/leave" {
-                                    let leave_msg = ClientRequest::Leave { room: room.clone() };
-                                    ws_sender.send(Message::Text(serde_json::to_string(&leave_msg)?)).await?;
-                                    messages.push("你已离开房间。".to_string());
-                                    break;
-                                } else if trimmed == "/members" {
-                                    // 查询当前房间成员
-                                    let req = ClientRequest::Members { room: room.clone() };
-                                    ws_sender.send(Message::Text(serde_json::to_string(&req)?)).await?;
-                                } else if !trimmed.is_empty() {
-                                    let msg = ClientRequest::Message { room: room.clone(), text: trimmed.into() };
-                                    ws_sender.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                                KeyCode::Esc => {
+                                    disable_tui()?;
+                                    return Ok(());
                                 }
+                                _ => {}
                             }
-                            input.clear();
                         }
-                        _ => {}
                     }
                 }
             }
         }
     }
+}
 
-    // 恢复终端
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+/// Parse and run slash commands.
+async fn handle_command<S>(
+    cmd: &str,
+    ws_sink: &mut S,
+    room: &mut Option<String>,
+    messages: &mut Vec<String>,
+) -> anyhow::Result<()>
+where
+    S: Sink<Message> + Unpin + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    match parts.as_slice() {
+        ["/join", room_name, name] => {
+            let req = ClientRequest::Join {
+                room: room_name.to_string(),
+                name: name.to_string(),
+            };
+            ws_sink.send(Message::Text(serde_json::to_string(&req)?)).await?;
+            *room = Some(room_name.to_string());
+        }
+        ["/leave"] => {
+            if let Some(r) = room.take() {
+                ws_sink
+                    .send(Message::Text(
+                        serde_json::to_string(&ClientRequest::Leave { room: r })?,
+                    ))
+                    .await?;
+            }
+        }
+        ["/rooms"] => {
+            ws_sink
+                .send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?))
+                .await?;
+        }
+        ["/members"] => {
+            if let Some(r) = room {
+                ws_sink
+                    .send(Message::Text(
+                        serde_json::to_string(&ClientRequest::Members { room: r.clone() })?,
+                    ))
+                    .await?;
+            } else {
+                messages.push("❗ not in any room".into());
+            }
+        }
+        _ => {
+            messages.push(
+                "❗ usage: /join <room> <name> | /leave | /rooms | /members".into(),
+            );
+        }
+    }
     Ok(())
+}
+
+/// Terminal helpers
+fn enable_tui() -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        terminal::EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    Ok(())
+}
+
+fn disable_tui() -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        terminal::LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal::disable_raw_mode()
+}
+
+fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Terminal::new(backend)
 }

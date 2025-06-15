@@ -1,25 +1,21 @@
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::accept_async;
-use futures_util::{StreamExt, SinkExt};
+use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::hub::HubCommand;
 use crate::protocol::{ClientRequest, ServerEvent};
 
-/// Start WebSocket listener and dispatch each connection to [`handle_ws_connection`].
-pub async fn start_ws_listener(
-    addr: &str,
-    hub_tx: mpsc::Sender<HubCommand>,
-) -> anyhow::Result<()> {
+/// Start WebSocket listener and spawn a task per connection.
+pub async fn start_ws_listener(addr: &str, hub_tx: mpsc::Sender<HubCommand>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("WebSocket listening on: {}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let hub_tx = hub_tx.clone();
+        let hub_clone = hub_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_ws_connection(stream, hub_tx).await {
+            if let Err(e) = handle_ws_connection(stream, hub_clone).await {
                 eprintln!("connection error: {:?}", e);
             }
         });
@@ -33,38 +29,32 @@ async fn handle_ws_connection(
     let ws_stream = accept_async(stream).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // 1. 等待 Join 指令
-    let (room, name);
-    loop {
+    // ---- 1. 等待 Join ----
+    let (room, name) = loop {
         let msg = ws_receiver
             .next()
             .await
             .ok_or_else(|| anyhow::anyhow!("Client disconnected before join"))??;
         let req: ClientRequest = serde_json::from_str(msg.to_text()?)?;
         match req {
-            ClientRequest::Join { room: r, name: n } => {
-                room = r;
-                name = n;
-                break;
-            }
+            ClientRequest::Join { room, name } => break (room, name),
             ClientRequest::RoomList => {
-                // 请求房间列表
                 let (resp_tx, mut resp_rx) = mpsc::channel(1);
                 hub_tx
                     .send(HubCommand::GetRoomList { resp: resp_tx })
                     .await?;
-                if let Some(room_list) = resp_rx.recv().await {
-                    let event = ServerEvent::RoomList { rooms: room_list };
-                    let msg = Message::Text(serde_json::to_string(&event)?);
-                    ws_sender.send(msg).await?;
+                if let Some(rooms) = resp_rx.recv().await {
+                    let ev = ServerEvent::RoomList { rooms };
+                    ws_sender
+                        .send(Message::Text(serde_json::to_string(&ev)?))
+                        .await?;
                 }
-                continue;
             }
             _ => continue,
         }
-    }
+    };
 
-    // 2. 加入房间，获取广播接收端
+    // ---- 2. 加入房间 ----
     let (resp_tx, mut resp_rx) = mpsc::channel(1);
     hub_tx
         .send(HubCommand::JoinRoom {
@@ -78,8 +68,27 @@ async fn handle_ws_connection(
         .await
         .ok_or_else(|| anyhow::anyhow!("Failed to get broadcast receiver"))?;
 
-    // 推送任务：负责所有 ws_sender 写
-    let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(8);
+    // ---- 3. 推送管道 & 历史补发 ----
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(32);
+
+    // 获取历史并先行推送
+    {
+        let (hist_tx, mut hist_rx) = mpsc::channel(1);
+        hub_tx
+            .send(HubCommand::GetHistory {
+                room: room.clone(),
+                resp: hist_tx,
+            })
+            .await?;
+        if let Some(history) = hist_rx.recv().await {
+            for ev in history {
+                let txt = serde_json::to_string(&ev)?;
+                msg_tx.send(Message::Text(txt)).await?;
+            }
+        }
+    }
+
+    // 将 msg_rx + broadcast_rx 合并写入 ws_sender
     let (close_tx, close_rx) = oneshot::channel::<()>();
     let push_task = tokio::spawn(async move {
         tokio::select! {
@@ -91,9 +100,9 @@ async fn handle_ws_connection(
                                 break;
                             }
                         }
-                        Ok(event) = broadcast_rx.recv() => {
-                            let json = serde_json::to_string(&event).unwrap();
-                            if ws_sender.send(Message::Text(json)).await.is_err() {
+                        Ok(ev) = broadcast_rx.recv() => {
+                            let txt = serde_json::to_string(&ev).unwrap();
+                            if ws_sender.send(Message::Text(txt)).await.is_err() {
                                 break;
                             }
                         }
@@ -106,7 +115,7 @@ async fn handle_ws_connection(
         }
     });
 
-    // 3. 主循环：处理客户端请求
+    // ---- 4. 主循环 ----
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if !msg.is_text() {
             continue;
@@ -114,17 +123,14 @@ async fn handle_ws_connection(
         let req: ClientRequest = serde_json::from_str(msg.to_text()?)?;
         match req {
             ClientRequest::Message { room, text } => {
-                let event = ServerEvent::NewMessage {
+                let ev = ServerEvent::NewMessage {
                     room: room.clone(),
                     name: name.clone(),
                     text,
-                    ts: chrono::Utc::now().timestamp() as u64,
+                    ts: chrono::Utc::now().timestamp_millis() as u64,
                 };
                 hub_tx
-                    .send(HubCommand::SendMsg {
-                        room: room.clone(),
-                        event,
-                    })
+                    .send(HubCommand::SendMsg { room, event: ev })
                     .await?;
             }
             ClientRequest::Leave { room } => {
@@ -138,7 +144,6 @@ async fn handle_ws_connection(
                 break;
             }
             ClientRequest::Members { room } => {
-                // 查询成员列表
                 let (resp_tx, mut resp_rx) = mpsc::channel(1);
                 hub_tx
                     .send(HubCommand::GetMembers {
@@ -146,16 +151,14 @@ async fn handle_ws_connection(
                         resp: resp_tx,
                     })
                     .await?;
-                if let Some(mem_list) = resp_rx.recv().await {
-                    let event = ServerEvent::MemberList {
-                        room: room.clone(),
-                        members: mem_list,
-                    };
-                    let text = serde_json::to_string(&event)?;
-                    msg_tx.send(Message::Text(text)).await?;
+                if let Some(list) = resp_rx.recv().await {
+                    let ev = ServerEvent::MemberList { room, members: list };
+                    msg_tx
+                        .send(Message::Text(serde_json::to_string(&ev)?))
+                        .await?;
                 }
             }
-            // 以下在已 Join 状态下不再出现或忽略
+            // 忽略不应出现的指令
             ClientRequest::Join { .. } | ClientRequest::RoomList => {}
         }
     }

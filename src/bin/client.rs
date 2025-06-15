@@ -1,17 +1,14 @@
-// src/bin/client.rs
-
 use my_chat::client::ui::start_cli_client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 可通过参数指定 ws 地址，默认 ws://127.0.0.1:9000
-    let args: Vec<String> = std::env::args().collect();
-    let ws_url = if args.len() > 1 {
-        &args[1]
-    } else {
-        "ws://127.0.0.1:9000"
-    };
+    // 跳过 argv[0] 程序名，取 argv[1] 作为可选 WebSocket URL
+    let ws_url_opt = std::env::args().skip(1).next();
 
-    println!("正在连接服务器 {} ...", ws_url);
-    start_cli_client(ws_url).await
+    match &ws_url_opt {
+        Some(url) => println!("Connecting to server {url} ..."),
+        None => println!("Connecting to default ws://127.0.0.1:9000 ..."),
+    }
+
+    start_cli_client(ws_url_opt).await
 }
