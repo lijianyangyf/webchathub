@@ -57,6 +57,9 @@ pub async fn start_cli_client(ws_url: &str) -> anyhow::Result<()> {
                         ServerEvent::RoomList { rooms } => {
                             let _ = msg_tx.send(format!("当前房间列表: {:?}", rooms));
                         }
+                        ServerEvent::MemberList { room, members } =>{
+                            let _ = msg_tx.send(format!("房间 [{}] 成员: {:?}", room, members));
+                        }
                     }
                 }
             } else if msg.is_close() {
@@ -102,55 +105,59 @@ pub async fn start_cli_client(ws_url: &str) -> anyhow::Result<()> {
 
         // 处理输入
         if event::poll(Duration::from_millis(80))? {
-        if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
-            // 只处理第一次按下（忽略重复）
-            if kind == KeyEventKind::Press {
-                match code {
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                    }
-                    KeyCode::Esc => break,
-                    KeyCode::Enter => {
-                        let trimmed = input.trim();
-                        if trimmed.is_empty() {
-                            input.clear();
-                            continue;
+            if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
+                // 只处理第一次按下（忽略重复）
+                if kind == KeyEventKind::Press {
+                    match code {
+                        KeyCode::Char(c) => {
+                            input.push(c);
                         }
-                        if !joined {
-                            let tokens: Vec<_> = trimmed.split_whitespace().collect();
-                            if tokens.len() == 1 && tokens[0] == "/rooms" {
-                                ws_sender.send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?)).await?;
-                            } else if tokens.len() == 3 && tokens[0] == "/join" {
-                                room = tokens[1].to_string();
-                                name = tokens[2].to_string();
-                                let join_msg = ClientRequest::Join { room: room.clone(), name: name.clone() };
-                                ws_sender.send(Message::Text(serde_json::to_string(&join_msg)?)).await?;
-                                joined = true;
-                                messages.push(format!("已加入房间 [{}]，现在可以发送消息，输入 /leave 退出。", room));
+                        KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        KeyCode::Esc => break,
+                        KeyCode::Enter => {
+                            let trimmed = input.trim();
+                            if trimmed.is_empty() {
+                                input.clear();
+                                continue;
+                            }
+                            if !joined {
+                                let tokens: Vec<_> = trimmed.split_whitespace().collect();
+                                if tokens.len() == 1 && tokens[0] == "/rooms" {
+                                    ws_sender.send(Message::Text(serde_json::to_string(&ClientRequest::RoomList)?)).await?;
+                                } else if tokens.len() == 3 && tokens[0] == "/join" {
+                                    room = tokens[1].to_string();
+                                    name = tokens[2].to_string();
+                                    let join_msg = ClientRequest::Join { room: room.clone(), name: name.clone() };
+                                    ws_sender.send(Message::Text(serde_json::to_string(&join_msg)?)).await?;
+                                    joined = true;
+                                    messages.push(format!("已加入房间 [{}]，现在可以发送消息，输入 /leave 退出。", room));
+                                } else {
+                                    messages.push("命令格式错误，请输入 /rooms 或 /join <房间名> <用户名>".to_string());
+                                }
                             } else {
-                                messages.push("命令格式错误，请输入 /rooms 或 /join <房间名> <用户名>".to_string());
+                                if trimmed == "/leave" {
+                                    let leave_msg = ClientRequest::Leave { room: room.clone() };
+                                    ws_sender.send(Message::Text(serde_json::to_string(&leave_msg)?)).await?;
+                                    messages.push("你已离开房间。".to_string());
+                                    break;
+                                } else if trimmed == "/members" {
+                                    // 查询当前房间成员
+                                    let req = ClientRequest::Members { room: room.clone() };
+                                    ws_sender.send(Message::Text(serde_json::to_string(&req)?)).await?;
+                                } else if !trimmed.is_empty() {
+                                    let msg = ClientRequest::Message { room: room.clone(), text: trimmed.into() };
+                                    ws_sender.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                                }
                             }
-                        } else {
-                            if trimmed == "/leave" {
-                                let leave_msg = ClientRequest::Leave { room: room.clone() };
-                                ws_sender.send(Message::Text(serde_json::to_string(&leave_msg)?)).await?;
-                                messages.push("你已离开房间。".to_string());
-                                break;
-                            } else if !trimmed.is_empty() {
-                                let msg = ClientRequest::Message { room: room.clone(), text: trimmed.into() };
-                                ws_sender.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                            }
+                            input.clear();
                         }
-                        input.clear();
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
-    }
     }
 
     // 恢复终端
