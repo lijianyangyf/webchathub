@@ -1,34 +1,44 @@
-// src/config.rs – 含历史消息容量 history_limit
+// src/config.rs – application runtime configuration
 // --------------------------------------------------
-// 通过环境变量 `HISTORY_LIMIT`（usize）控制，每房间环形缓冲默认 100 条。
+// * `history_limit`   – ring‑buffer size per room (1‑B)
+// * `room_ttl_secs`  – TTL for empty rooms (1‑C)
+//
+// All values can be overridden via environment variables as documented below.
 
 use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// WebSocket 监听地址，如 "127.0.0.1:9000"
+    /// WebSocket listen address, e.g. "0.0.0.0:9000"
     pub server_addr: String,
-    /// 日志等级："info" / "debug" 等
+    /// Log level: trace|debug|info|warn|error
     pub log_level: String,
-    /// 每个房间保留的历史消息条数（环形缓冲大小）
+    /// Messages kept per room (history replay)
     pub history_limit: usize,
+    /// Seconds before an empty room is garbage‑collected
+    pub room_ttl_secs: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_addr: "127.0.0.1:9000".into(),
+            server_addr: "0.0.0.0:9000".into(),
             log_level: "info".into(),
             history_limit: 100,
+            room_ttl_secs: 300, // 5 minutes
         }
     }
 }
 
 impl Config {
-    /// 从环境变量加载配置，未设置字段使用默认值：
-    /// * `SERVER_ADDR`
-    /// * `LOG_LEVEL`
-    /// * `HISTORY_LIMIT`
+    /// Load from environment variables with fallback to defaults.
+    ///
+    /// | Env Var          | Type  | Default | Description                     |
+    /// |------------------|-------|---------|---------------------------------|
+    /// | `SERVER_ADDR`    | str   | see default | bind address                |
+    /// | `LOG_LEVEL`      | str   | "info" | log verbosity                  |
+    /// | `HISTORY_LIMIT`  | usize | 100     | per‑room history size          |
+    /// | `ROOM_TTL_SECS`  | u64   | 300     | seconds to keep empty rooms    |
     pub fn from_env() -> Self {
         let def = Self::default();
         Self {
@@ -38,6 +48,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(def.history_limit),
+            room_ttl_secs: env::var("ROOM_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(def.room_ttl_secs),
         }
     }
 }
@@ -49,26 +63,29 @@ mod tests {
     #[test]
     fn defaults() {
         let cfg = Config::default();
-        assert_eq!(cfg.server_addr, "127.0.0.1:9000");
+        assert_eq!(cfg.server_addr, "0.0.0.0:9000");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.history_limit, 100);
+        assert_eq!(cfg.room_ttl_secs, 300);
     }
 
     #[test]
     fn env_override() {
         let _guard = EnvGuard::set(vec![
-            ("SERVER_ADDR", "0.0.0.0:8080"),
+            ("SERVER_ADDR", "127.0.0.1:8080"),
             ("LOG_LEVEL", "debug"),
             ("HISTORY_LIMIT", "256"),
+            ("ROOM_TTL_SECS", "600"),
         ]);
 
         let cfg = Config::from_env();
-        assert_eq!(cfg.server_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.server_addr, "127.0.0.1:8080");
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.history_limit, 256);
+        assert_eq!(cfg.room_ttl_secs, 600);
     }
 
-    /// RAII 环境变量守卫，测试结束后自动清理。
+    /// Simple RAII env guard for tests
     struct EnvGuard {
         keys: Vec<&'static str>,
     }
@@ -78,9 +95,7 @@ mod tests {
             for (k, v) in &pairs {
                 unsafe{env::set_var(k, v);}
             }
-            Self {
-                keys: pairs.into_iter().map(|(k, _)| k).collect(),
-            }
+            Self { keys: pairs.into_iter().map(|(k, _)| k).collect() }
         }
     }
 
