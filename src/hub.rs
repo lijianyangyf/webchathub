@@ -1,175 +1,142 @@
-// src/hub.rs – borrow‑checker & BytesMut::Write fixes
-// ---------------------------------------------------
-// * Remove `self` from broadcast helper to avoid double mutable borrow.
-// * Use `serde_json::to_vec` then `extend_from_slice`, so no need for Write.
+// src/hub.rs – router‑only hub (2‑B final)
+// ------------------------------------------------
+// The hub no longer stores room state; each room lives in its own Tokio
+// task (see `room.rs`). The hub only keeps an `mpsc::Sender<RoomCmd>` for
+// every active room and a `JoinHandle` so it can await / detach when the
+// room terminates (e.g. TTL expiry).
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use bytes::Bytes;
-use tokio::sync::{broadcast, mpsc};
-use tokio::time::{interval, Interval};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::memory_pool::MemoryPool;
 use crate::protocol::ServerEvent;
+use crate::room::{spawn_room_task, RoomCmd};
 
-fn is_chat(ev: &ServerEvent) -> bool {
-    matches!(ev, ServerEvent::NewMessage { .. })
-}
-
-pub enum HubCommand {
-    JoinRoom {
+/// Commands accepted by [`ChatHub`].
+pub enum HubCmd {
+    Join {
         room: String,
         name: String,
-        resp: mpsc::Sender<broadcast::Receiver<Bytes>>, // receiver of pooled frames
+        /// oneshot channel to return a broadcast receiver for this client
+        resp: oneshot::Sender<broadcast::Receiver<Bytes>>, 
     },
-    SendMsg {
+    Send {
         room: String,
         event: ServerEvent,
     },
-    LeaveRoom {
+    Leave {
         room: String,
         name: String,
     },
-    GetRoomList {
-        resp: mpsc::Sender<Vec<String>>, // list current rooms
-    },
     GetMembers {
         room: String,
-        resp: mpsc::Sender<Vec<String>>,
+        resp: oneshot::Sender<Vec<String>>,
     },
     GetHistory {
         room: String,
-        resp: mpsc::Sender<Vec<Bytes>>, // history frames
+        resp: oneshot::Sender<Vec<Bytes>>,
+    },
+    GetRoomList {
+        resp: oneshot::Sender<Vec<String>>,
     },
 }
 
-struct Room {
-    tx: broadcast::Sender<Bytes>,
-    members: HashSet<String>,
-    history: VecDeque<Bytes>,
-    last_empty_at: Option<Instant>,
+struct RoomHandle {
+    tx: mpsc::Sender<RoomCmd>,
+    _join: JoinHandle<()>, // kept to avoid detaching silently
 }
 
-impl Room {
-    fn new(cap: usize) -> Self {
-        let (tx, _) = broadcast::channel(128);
-        Self {
-            tx,
-            members: HashSet::new(),
-            history: VecDeque::with_capacity(cap),
-            last_empty_at: None,
-        }
-    }
-}
-
+/// Lightweight router hub
 pub struct ChatHub {
-    rooms: HashMap<String, Room>,
-    cmd_rx: mpsc::Receiver<HubCommand>,
-    history_limit: usize,
-    room_ttl: Duration,
+    rooms: HashMap<String, RoomHandle>,
+    rx: mpsc::Receiver<HubCmd>,
+    cfg: Config,
 }
 
 impl ChatHub {
-    pub fn new(cmd_rx: mpsc::Receiver<HubCommand>) -> Self {
-        let cfg = Config::from_env();
+    pub fn new(rx: mpsc::Receiver<HubCmd>) -> Self {
         Self {
             rooms: HashMap::new(),
-            cmd_rx,
-            history_limit: cfg.history_limit,
-            room_ttl: Duration::from_secs(cfg.room_ttl_secs),
+            rx,
+            cfg: Config::from_env(),
         }
     }
 
-    pub async fn run(&mut self) {
-        let mut sweep: Interval = interval(self.room_ttl.max(Duration::from_secs(1)));
-        loop {
-            tokio::select! {
-                biased;
-                Some(cmd) = self.cmd_rx.recv() => { self.handle_cmd(cmd).await; }
-                _ = sweep.tick() => { self.gc_empty_rooms(); }
-            }
+    /// Spawn hub task; returns sender side.
+    pub fn spawn() -> mpsc::Sender<HubCmd> {
+        let (tx, rx) = mpsc::channel(256);
+        let mut hub = ChatHub::new(rx);
+        tokio::spawn(async move { hub.run().await });
+        tx
+    }
+
+    async fn run(&mut self) {
+        while let Some(cmd) = self.rx.recv().await {
+            self.handle_cmd(cmd).await;
         }
     }
 
-    async fn handle_cmd(&mut self, cmd: HubCommand) {
+    async fn room_entry(&mut self, room: &str) -> &RoomHandle {
+        if !self.rooms.contains_key(room) {
+            let (tx, jh) = spawn_room_task(&self.cfg, room.to_string());
+            self.rooms.insert(room.to_string(), RoomHandle { tx, _join: jh });
+        }
+        // unwrap safe now
+        self.rooms.get(room).unwrap()
+    }
+
+    async fn handle_cmd(&mut self, cmd: HubCmd) {
         match cmd {
-            HubCommand::JoinRoom { room, name, resp } => {
-                let room_ref = self.rooms.entry(room.clone()).or_insert_with(|| Room::new(self.history_limit));
-                room_ref.members.insert(name.clone());
-                room_ref.last_empty_at = None;
-                let _ = resp.send(room_ref.tx.subscribe()).await;
-                let evt = ServerEvent::UserJoined { room, name };
-                broadcast_event(room_ref, evt, self.history_limit);
-            }
-            HubCommand::SendMsg { room, event } => {
-                if let Some(room_ref) = self.rooms.get_mut(&room) {
-                    broadcast_event(room_ref, event, self.history_limit);
+            HubCmd::Join { room, name, resp } => {
+                let room_handle = self.room_entry(&room).await;
+                let (rx_tx, rx_rx) = oneshot::channel();
+                // forward
+                let _ = room_handle
+                    .tx
+                    .send(RoomCmd::Join { name, resp: rx_tx })
+                    .await;
+                // wait for room to give us broadcast receiver then relay back
+                if let Ok(bc_rx) = rx_rx.await {
+                    let _ = resp.send(bc_rx);
                 }
             }
-            HubCommand::LeaveRoom { room, name } => {
-                if let Some(room_ref) = self.rooms.get_mut(&room) {
-                    let evt = ServerEvent::UserLeft { room: room.clone(), name: name.clone() };
-                    broadcast_event(room_ref, evt, self.history_limit);
-                    room_ref.members.remove(&name);
-                    if room_ref.members.is_empty() {
-                        room_ref.last_empty_at = Some(Instant::now());
-                    }
+            HubCmd::Send { room, event } => {
+                if let Some(handle) = self.rooms.get(&room) {
+                    let _ = handle.tx.send(RoomCmd::Send ( event )).await;
                 }
             }
-            HubCommand::GetRoomList { resp } => {
+            HubCmd::Leave { room, name } => {
+                if let Some(handle) = self.rooms.get(&room) {
+                    let _ = handle.tx.send(RoomCmd::Leave { name }).await;
+                }
+            }
+            HubCmd::GetMembers { room, resp } => {
+                if let Some(handle) = self.rooms.get(&room) {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = handle.tx.send(RoomCmd::GetMembers { resp: tx }).await;
+                    let _ = resp.send(rx.await.unwrap_or_default());
+                } else {
+                    let _ = resp.send(Vec::new());
+                }
+            }
+            HubCmd::GetHistory { room, resp } => {
+                if let Some(handle) = self.rooms.get(&room) {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = handle.tx.send(RoomCmd::GetHistory { resp: tx }).await;
+                    let _ = resp.send(rx.await.unwrap_or_default());
+                } else {
+                    let _ = resp.send(Vec::new());
+                }
+            }
+            HubCmd::GetRoomList { resp } => {
+                self.rooms.retain(|_, h| !h.tx.is_closed());
                 let list: Vec<String> = self.rooms.keys().cloned().collect();
-                let _ = resp.send(list).await;
-            }
-            HubCommand::GetMembers { room, resp } => {
-                let members = self.rooms
-                    .get(&room)
-                    .map(|r| r.members.iter().cloned().collect())
-                    .unwrap_or_default();
-                let _ = resp.send(members).await;
-            }
-            HubCommand::GetHistory { room, resp } => {
-                let msgs = self.rooms
-                    .get(&room)
-                    .map(|r| r.history.iter().cloned().collect())
-                    .unwrap_or_default();
-                let _ = resp.send(msgs).await;
+                let _ = resp.send(list);
             }
         }
     }
-
-    fn gc_empty_rooms(&mut self) {
-        let now = Instant::now();
-        let ttl = self.room_ttl;
-        self.rooms.retain(|name, room| {
-            if room.members.is_empty() {
-                if let Some(t) = room.last_empty_at {
-                    if now.duration_since(t) > ttl {
-                        tracing::info!(room = %name, "room expired after TTL");
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-    }
 }
 
-/// Serialize `ServerEvent` once, broadcast as `Bytes`, and record to history.
-fn broadcast_event(room: &mut Room, event: ServerEvent, limit: usize) {
-    // serialize to vec first
-    let vec = serde_json::to_vec(&event).expect("serialize");
-    let mut buf = MemoryPool::global().alloc(vec.len());
-    buf.extend_from_slice(&vec);
-    let frame: Bytes = buf.freeze();
-
-    let _ = room.tx.send(frame.clone());
-
-    if is_chat(&event) {
-        room.history.push_back(frame);
-        if room.history.len() > limit {
-            room.history.pop_front();
-        }
-    }
-}

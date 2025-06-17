@@ -1,48 +1,49 @@
-// src/memory_pool.rs – v2 with global() + freeze() returning Bytes
-// --------------------------------------------------------------
-// Purpose: provide a simple slab‑backed buffer pool (BytesMut) and
-// allow callers to obtain immutable `bytes::Bytes` frames for cheap
-// cloning / broadcasting.
+// src/memory_pool.rs – v3: thread‑pool integration
+// -------------------------------------------------
+// A simple slab‑backed buffer pool plus a lightweight blocking
+// thread‑pool interface for CPU‑intensive work (e.g. JSON encoding).
 //
-// API:
-//   MemoryPool::global() -> &'static MemoryPool
-//   alloc(size)          -> PooledBytes
+// * Pool: `slab::Slab<BytesMut>` protected by `Mutex`.
+// * Public API:
+//     MemoryPool::global()        – singleton
+//     alloc(size) -> PooledBytes  – mutable buffer
+//     spawn(move |pool| { ... })  – run on blocking threads
 //
-//   impl PooledBytes {
-//       fn freeze(self) -> Bytes  // transfers data, recycles buffer
-//   }
-//   Drop for PooledBytes auto‑recycles if not frozen.
+// * `PooledBytes` converts to immutable `bytes::Bytes` via `freeze()`. When
+//   dropped (or frozen) the underlying allocation is returned to the slab for
+//   future reuse.
 //
+// The thread‑pool uses `tokio::task::spawn_blocking`. Concurrency is limited by
+// Tokio’s global blocking semaphore (defaults to 512) but can be tuned by
+// the `TOKIO_MAX_BLOCKING_THREADS` env‑var. For fine‑grained control you can
+// build the Tokio runtime manually; here we rely on the default.
+
 use bytes::{Bytes, BytesMut};
 use once_cell::sync::Lazy;
 use slab::Slab;
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 
-/// Pooled mutable buffer – writeable while in scope.
+/// RAII wrapper around a pooled `BytesMut`.
 #[derive(Debug)]
 pub struct PooledBytes {
-    buf: Option<BytesMut>, // None after freeze or recycle
-    key: usize,
+    buf: Option<BytesMut>,
 }
 
 impl PooledBytes {
-    /// Convert into immutable `Bytes`, recycling the inner allocation.
+    /// Convert self into immutable `Bytes`, recycling the backing storage.
     pub fn freeze(mut self) -> Bytes {
-        let bytes = self
-            .buf
-            .take()
-            .expect("already frozen/recycled")
-            .freeze();
-        // recycle empty buffer back into the pool (zero‑len BytesMut)
-        MemoryPool::global().recycle_raw(self.key, BytesMut::new());
+        let bytes = self.buf.take().expect("already frozen").freeze();
+        // recycle empty buffer back to pool
+        MemoryPool::global().recycle_raw(BytesMut::new());
         bytes
     }
 
-    /// Manually recycle without freezing (discard contents).
+    /// Manually recycle without converting.
     pub fn recycle(mut self) {
-        let buf = self.buf.take().unwrap_or_default();
-        MemoryPool::global().recycle_raw(self.key, buf);
+        if let Some(b) = self.buf.take() {
+            MemoryPool::global().recycle_raw(b);
+        }
     }
 }
 
@@ -61,60 +62,50 @@ impl DerefMut for PooledBytes {
 impl Drop for PooledBytes {
     fn drop(&mut self) {
         if let Some(buf) = self.buf.take() {
-            MemoryPool::global().recycle_raw(self.key, buf);
+            MemoryPool::global().recycle_raw(buf);
         }
     }
 }
 
-/// Global buffer pool guarded by a Mutex (coarse but simple).
+/// Global mutable buffer pool.
 #[derive(Default)]
 pub struct MemoryPool {
-    slabs: Mutex<Slab<BytesMut>>, // key -> buffer
+    slabs: Mutex<Slab<BytesMut>>, // simple, lock per op
 }
 
 impl MemoryPool {
-    /// Obtain global singleton.
+    /// Global singleton accessor.
     pub fn global() -> &'static MemoryPool {
         static INSTANCE: Lazy<MemoryPool> = Lazy::new(|| MemoryPool::default());
         &INSTANCE
     }
 
-    /// Allocate a buffer of at least `size` bytes.
+    /// Allocate a buffer with at least `size` bytes capacity.
     pub fn alloc(&self, size: usize) -> PooledBytes {
         let mut slabs = self.slabs.lock().unwrap();
-        // find a vacant entry with >= size capacity
-        if let Some((key, _)) = slabs
-            .iter()
-            .find(|(_, buf)| buf.capacity() >= size)
-        {
+        // find reusable buffer
+        if let Some((key, _)) = slabs.iter().find(|(_, b)| b.capacity() >= size) {
             let buf = slabs.remove(key);
-            return PooledBytes { buf: Some(buf), key };
+            return PooledBytes { buf: Some(buf) };
         }
-        // else allocate new buffer
-        let key = slabs.insert(BytesMut::with_capacity(size));
-        let buf = slabs.remove(key);
-        PooledBytes { buf: Some(buf), key }
+        // allocate fresh
+        let buf = BytesMut::with_capacity(size);
+        PooledBytes { buf: Some(buf) }
     }
 
-    /// Return raw buffer back to slab.
-    fn recycle_raw(&self, key: usize, mut buf: BytesMut) {
+    /// Recycle raw buffer (cleared).
+    fn recycle_raw(&self, mut buf: BytesMut) {
         buf.clear();
         let mut slabs = self.slabs.lock().unwrap();
-        let _old = slabs.insert_at_vacant(key, buf);
+        let _ = slabs.insert(buf); // ignore index
     }
-}
 
-/// Extension trait to expose `insert_at_vacant` (not in public API) – we fake it
-/// by removing then inserting which preserves key reuse.
-trait SlabVacant<T> {
-    fn insert_at_vacant(&mut self, key: usize, val: T);
-}
-impl<T> SlabVacant<T> for Slab<T> {
-    fn insert_at_vacant(&mut self, key: usize, val: T) {
-        if self.contains(key) {
-            // occupied (should not happen)
-            return;
-        }
-        let _ = self.insert(val);
+    /// Run a closure on a blocking thread with access to the global pool.
+    pub fn spawn<F, R>(f: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce(&MemoryPool) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || f(MemoryPool::global()))
     }
 }

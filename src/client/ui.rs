@@ -131,6 +131,8 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
                                         handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;
                                         if cmd == "/leave" {
                                             messages.clear(); // free history memory
+                                            disable_tui()?;
+                                            return Ok(());
                                         }
                                     } else if let Some(r) = &room {
                                         let req = ClientRequest::Message { room: r.clone(), text: cmd };
@@ -139,10 +141,12 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
                                         messages.push("❗ join a room first".into());
                                     }
                                 }
-                                KeyCode::Esc => {
+                                /*KeyCode::Esc => {
+                                    let cmd = "/Leave".to_string();
+                                    if room.is_some() {handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;}
                                     disable_tui()?;
                                     return Ok(());
-                                }
+                                }*/
                                 _ => {}
                             }
                         }
