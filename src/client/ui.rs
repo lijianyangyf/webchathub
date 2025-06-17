@@ -1,12 +1,3 @@
-//! Terminal UI client based on `tui` + `crossterm`
-//
-// Commands (type in the input box):
-//   /join <room> <name>
-//   /leave
-//   /rooms
-//   /members
-//   <any other text>   -- send chat message
-
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -20,7 +11,7 @@ use tokio::{
     select,
     sync::mpsc,
     task,
-    time::{self, sleep},
+    time::{sleep},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui::{
@@ -141,12 +132,16 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
                                         messages.push("❗ join a room first".into());
                                     }
                                 }
-                                /*KeyCode::Esc => {
-                                    let cmd = "/Leave".to_string();
-                                    if room.is_some() {handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;}
+                                KeyCode::Esc => {
+                                    if let Some(r) = &room {
+                                        let leave = ClientRequest::Leave { room: r.clone() };
+                                        ws_sink
+                                            .send(Message::Text(serde_json::to_string(&leave)?))
+                                            .await?;
+                                    }
                                     disable_tui()?;
                                     return Ok(());
-                                }*/
+                                }
                                 _ => {}
                             }
                         }

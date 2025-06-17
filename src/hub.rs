@@ -1,10 +1,3 @@
-// src/hub.rs – router‑only hub (2‑B final)
-// ------------------------------------------------
-// The hub no longer stores room state; each room lives in its own Tokio
-// task (see `room.rs`). The hub only keeps an `mpsc::Sender<RoomCmd>` for
-// every active room and a `JoinHandle` so it can await / detach when the
-// room terminates (e.g. TTL expiry).
-
 use std::collections::HashMap;
 
 use bytes::Bytes;

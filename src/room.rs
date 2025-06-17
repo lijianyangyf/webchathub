@@ -1,22 +1,3 @@
-// src/room.rs – fully‑featured per‑room task (2‑B)
-// -------------------------------------------------
-// Each chat room lives in its own Tokio task. The Hub only holds an
-// mpsc::Sender<RoomCmd> for routing.  The room task owns:
-//   * broadcast::Sender<Bytes>        – fan‑out to websocket connections
-//   * HashSet<String> members         – online users
-//   * VecDeque<Bytes> history         – ring buffer (size = cfg.history_limit)
-//   * Option<Instant> last_empty_at   – for TTL cleanup
-//
-// Public API
-// ----------
-// `RoomCmd` enum – messages Hub can send to the room.
-// `spawn_room_task(cfg: &Config, room: String) -> (mpsc::Sender<RoomCmd>, JoinHandle<()>)`
-//
-// Internals
-// ---------
-// * All outgoing frames are serialized `ServerEvent` encoded via MemoryPool → Bytes.
-// * TTL sweep runs every second; when elapsed > room_ttl and members.is_empty(), the task exits.
-
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 

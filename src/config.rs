@@ -1,10 +1,3 @@
-// src/config.rs – application runtime configuration
-// --------------------------------------------------
-// * `history_limit`   – ring‑buffer size per room (1‑B)
-// * `room_ttl_secs`  – TTL for empty rooms (1‑C)
-//
-// All values can be overridden via environment variables as documented below.
-
 use std::env;
 
 #[derive(Debug, Clone)]

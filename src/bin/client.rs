@@ -2,7 +2,6 @@ use my_chat::client::ui::start_cli_client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 跳过 argv[0] 程序名，取 argv[1] 作为可选 WebSocket URL
     let ws_url_opt = std::env::args().skip(1).next();
 
     match &ws_url_opt {

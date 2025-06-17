@@ -1,23 +1,3 @@
-// src/memory_pool.rs – v3: thread‑pool integration
-// -------------------------------------------------
-// A simple slab‑backed buffer pool plus a lightweight blocking
-// thread‑pool interface for CPU‑intensive work (e.g. JSON encoding).
-//
-// * Pool: `slab::Slab<BytesMut>` protected by `Mutex`.
-// * Public API:
-//     MemoryPool::global()        – singleton
-//     alloc(size) -> PooledBytes  – mutable buffer
-//     spawn(move |pool| { ... })  – run on blocking threads
-//
-// * `PooledBytes` converts to immutable `bytes::Bytes` via `freeze()`. When
-//   dropped (or frozen) the underlying allocation is returned to the slab for
-//   future reuse.
-//
-// The thread‑pool uses `tokio::task::spawn_blocking`. Concurrency is limited by
-// Tokio’s global blocking semaphore (defaults to 512) but can be tuned by
-// the `TOKIO_MAX_BLOCKING_THREADS` env‑var. For fine‑grained control you can
-// build the Tokio runtime manually; here we rely on the default.
-
 use bytes::{Bytes, BytesMut};
 use once_cell::sync::Lazy;
 use slab::Slab;
