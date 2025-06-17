@@ -1,6 +1,6 @@
-# my_chat
+# webchathub
 
-> _my_chat_ 是用 Rust 编写的轻量级多房间 WebSocket 聊天系统，包含 **无依赖服务器** + **跨平台 TUI 客户端**，零配置即可运行。
+> _webchathub_ 是用 Rust 编写的轻量级多房间 WebSocket 聊天系统，包含 **无依赖服务器** + **跨平台 TUI 客户端**，零配置即可运行。
 
 ## ✨ 特色
 
@@ -14,7 +14,7 @@
 ## 目录结构
 
 ```text
-my_chat/
+webchathub/
 ├─ Cargo.toml               # 依赖与构建元数据
 ├─ src/
 │  ├─ bin/                  # 可执行入口

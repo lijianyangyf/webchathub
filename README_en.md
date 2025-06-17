@@ -1,6 +1,6 @@
-# my_chat
+# webchathub
 
-> **my_chat** is a lightweight multi‑room WebSocket chat system written in Rust.  
+> **webchathub** is a lightweight multi‑room WebSocket chat system written in Rust.  
 > It ships with a **dependency‑free server** and a **cross‑platform TUI client**, ready to run out‑of‑the‑box.
 
 ## ✨ Highlights
@@ -15,7 +15,7 @@
 ## Project Layout
 
 ```text
-my_chat/
+webchathub/
 ├─ Cargo.toml               # Build metadata & dependencies
 ├─ src/
 │  ├─ bin/                  # Executable entry points
