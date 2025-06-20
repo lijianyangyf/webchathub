@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chrono::{Local, TimeZone};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,KeyEvent,KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,KeyEvent,KeyEventKind,MouseEvent, MouseEventKind},
     execute, terminal,
 };
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -82,6 +82,10 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
     let mut messages: Vec<String> = Vec::new();
     let mut room: Option<String> = None;
 
+    let mut scroll_index: usize = 0; // 用于控制当前显示的起始消息
+    let mut total_messages: usize = 0; // 用于存储总的消息条数
+
+
     loop {
         // Draw
         terminal.draw(|f| {
@@ -91,8 +95,13 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
                 .constraints([Constraint::Percentage(85), Constraint::Percentage(15)].as_ref())
                 .split(f.size());
 
+            let visible_messages = messages.iter()
+                .skip(scroll_index) // 从当前显示位置开始显示
+                .take(20)  // 最多显示 10 条消息
+                .collect::<Vec<_>>(); // 取出当前应该显示的消息
+
             let items: Vec<ListItem> =
-                messages.iter().map(|m| ListItem::new(Spans::from(m.as_str()))).collect();
+                visible_messages.iter().map(|m| ListItem::new(Spans::from(m.as_str()))).collect();
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title("Messages"));
             f.render_widget(list, chunks[0]);
@@ -106,44 +115,77 @@ pub async fn start_cli_client(ws_addr: Option<String>) -> anyhow::Result<()> {
         select! {
             Some(line) = ui_rx.recv() => {
                 messages.push(line);
+                total_messages += 1;
             }
+            
 
             _ = sleep(Duration::from_millis(10)) => {
                 while event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
-                        if kind == KeyEventKind::Press {
-                            match code {
-                                KeyCode::Char(c) => input.push(c),
-                                KeyCode::Backspace => { input.pop(); }
-                                KeyCode::Enter => {
-                                    let cmd = input.trim().to_string();
-                                    input.clear();
-                                    if cmd.starts_with('/') {
-                                        handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;
-                                        if cmd == "/leave" {
-                                            messages.clear(); // free history memory
+                    if let Ok(evt) = event::read(){
+                        match evt{
+                            Event::Mouse(mouse_event) => {
+                                match mouse_event.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        if scroll_index > 0 {
+                                            scroll_index -= 1; // 向上滚动，减少显示的起始位置
+                                        }
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        if scroll_index + 20 < total_messages {
+                                            scroll_index += 1; // 向下滚动，增加显示的起始位置
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Event::Key(KeyEvent { code, kind, .. }) => {
+                                if kind == KeyEventKind::Press {
+                                    match code {
+                                        KeyCode::Char(c) => input.push(c),
+                                        KeyCode::Backspace => { input.pop(); }
+                                        KeyCode::Enter => {
+                                            let cmd = input.trim().to_string();
+                                            input.clear();
+                                            if cmd.starts_with('/') {
+                                                handle_command(&cmd, &mut ws_sink, &mut room, &mut messages).await?;
+                                                if cmd == "/leave" {
+                                                    messages.clear(); // free history memory
+                                                    disable_tui()?;
+                                                    return Ok(());
+                                                }
+                                            } else if let Some(r) = &room {
+                                                let req = ClientRequest::Message { room: r.clone(), text: cmd };
+                                                ws_sink.send(Message::Text(serde_json::to_string(&req)?)).await?;
+                                            } else {
+                                                messages.push("❗ join a room first".into());
+                                            }
+                                        }
+                                        KeyCode::Esc => {
+                                            if let Some(r) = &room {
+                                                let leave = ClientRequest::Leave { room: r.clone() };
+                                                ws_sink
+                                                    .send(Message::Text(serde_json::to_string(&leave)?))
+                                                    .await?;
+                                            }
                                             disable_tui()?;
                                             return Ok(());
                                         }
-                                    } else if let Some(r) = &room {
-                                        let req = ClientRequest::Message { room: r.clone(), text: cmd };
-                                        ws_sink.send(Message::Text(serde_json::to_string(&req)?)).await?;
-                                    } else {
-                                        messages.push("❗ join a room first".into());
+                                        KeyCode::Up=> {
+                                            scroll_index = 0;
+                                        }
+                                        KeyCode::Down => {
+                                            // Move scroll_index to show the latest 10 messages
+                                            if total_messages >= 20 {
+                                                scroll_index = total_messages - 20;
+                                            } else {
+                                                scroll_index = 0; // Show all if there are fewer than 10 messages
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                KeyCode::Esc => {
-                                    if let Some(r) = &room {
-                                        let leave = ClientRequest::Leave { room: r.clone() };
-                                        ws_sink
-                                            .send(Message::Text(serde_json::to_string(&leave)?))
-                                            .await?;
-                                    }
-                                    disable_tui()?;
-                                    return Ok(());
-                                }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
